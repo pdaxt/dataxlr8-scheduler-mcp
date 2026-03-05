@@ -4,7 +4,42 @@ use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, error};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const DEFAULT_LIMIT: i64 = 50;
+const MAX_LIMIT: i64 = 500;
+const DEFAULT_OFFSET: i64 = 0;
+
+const VALID_TASK_TYPES: &[&str] = &["send_email", "follow_up", "reminder"];
+const VALID_STATUSES: &[&str] = &["pending", "running", "completed", "failed", "cancelled"];
+const VALID_PATTERNS: &[&str] = &["daily", "weekly", "monthly"];
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Extract a trimmed string from args, returning None if missing or empty after trim.
+fn get_trimmed_str(args: &serde_json::Value, key: &str) -> Option<String> {
+    get_str(args, key).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Clamp a limit value to [1, MAX_LIMIT], defaulting to DEFAULT_LIMIT.
+fn clamp_limit(args: &serde_json::Value) -> i64 {
+    get_i64(args, "limit")
+        .unwrap_or(DEFAULT_LIMIT)
+        .clamp(1, MAX_LIMIT)
+}
+
+/// Get offset, clamped to >= 0, defaulting to DEFAULT_OFFSET.
+fn clamp_offset(args: &serde_json::Value) -> i64 {
+    get_i64(args, "offset")
+        .unwrap_or(DEFAULT_OFFSET)
+        .max(0)
+}
 
 // ============================================================================
 // Data types
@@ -64,7 +99,8 @@ fn build_tools() -> Vec<Tool> {
                 serde_json::json!({
                     "status": { "type": "string", "enum": ["pending", "running", "completed", "failed", "cancelled"], "description": "Filter by status" },
                     "task_type": { "type": "string", "enum": ["send_email", "follow_up", "reminder"], "description": "Filter by task type" },
-                    "limit": { "type": "integer", "description": "Max results (default 50)" }
+                    "limit": { "type": "integer", "description": "Max results (default 50, max 500)" },
+                    "offset": { "type": "integer", "description": "Number of rows to skip (default 0)" }
                 }),
                 Vec::<&str>::new(),
             ),
@@ -154,7 +190,8 @@ fn build_tools() -> Vec<Tool> {
             description: Some("Find tasks past their run_at that haven't been executed (status still pending)".into()),
             input_schema: make_schema(
                 serde_json::json!({
-                    "limit": { "type": "integer", "description": "Max results (default 50)" }
+                    "limit": { "type": "integer", "description": "Max results (default 50, max 500)" },
+                    "offset": { "type": "integer", "description": "Number of rows to skip (default 0)" }
                 }),
                 Vec::<&str>::new(),
             ),
@@ -182,21 +219,21 @@ impl SchedulerMcpServer {
     }
 
     fn parse_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-        s.parse::<chrono::DateTime<chrono::Utc>>().ok()
+        s.trim().parse::<chrono::DateTime<chrono::Utc>>().ok()
     }
 
     // ---- Tool handlers ----
 
     async fn handle_schedule_task(&self, args: &serde_json::Value) -> CallToolResult {
-        let task_type = match get_str(args, "task_type") {
+        let task_type = match get_trimmed_str(args, "task_type") {
             Some(t) => t,
             None => return error_result("Missing required parameter: task_type"),
         };
-        if !["send_email", "follow_up", "reminder"].contains(&task_type.as_str()) {
+        if !VALID_TASK_TYPES.contains(&task_type.as_str()) {
             return error_result("task_type must be one of: send_email, follow_up, reminder");
         }
 
-        let run_at_str = match get_str(args, "run_at") {
+        let run_at_str = match get_trimmed_str(args, "run_at") {
             Some(r) => r,
             None => return error_result("Missing required parameter: run_at"),
         };
@@ -219,17 +256,33 @@ impl SchedulerMcpServer {
         .await
         {
             Ok(task) => {
-                info!(id = id, task_type = task_type, "Scheduled task");
+                info!(id = %id, task_type = %task_type, "Scheduled task");
                 json_result(&task)
             }
-            Err(e) => error_result(&format!("Failed to schedule task: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to schedule task");
+                error_result(&format!("Failed to schedule task: {e}"))
+            }
         }
     }
 
     async fn handle_list_scheduled(&self, args: &serde_json::Value) -> CallToolResult {
-        let status = get_str(args, "status");
-        let task_type = get_str(args, "task_type");
-        let limit = get_i64(args, "limit").unwrap_or(50);
+        let status = get_trimmed_str(args, "status");
+        let task_type = get_trimmed_str(args, "task_type");
+        let limit = clamp_limit(args);
+        let offset = clamp_offset(args);
+
+        // Validate enum values if provided
+        if let Some(ref s) = status {
+            if !VALID_STATUSES.contains(&s.as_str()) {
+                return error_result("status must be one of: pending, running, completed, failed, cancelled");
+            }
+        }
+        if let Some(ref t) = task_type {
+            if !VALID_TASK_TYPES.contains(&t.as_str()) {
+                return error_result("task_type must be one of: send_email, follow_up, reminder");
+            }
+        }
 
         // Build dynamic query
         let mut conditions = Vec::new();
@@ -250,8 +303,12 @@ impl SchedulerMcpServer {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
+        let limit_idx = param_idx;
+        param_idx += 1;
+        let offset_idx = param_idx;
+
         let query_str = format!(
-            "SELECT * FROM scheduler.tasks {where_clause} ORDER BY run_at ASC LIMIT ${param_idx}"
+            "SELECT * FROM scheduler.tasks {where_clause} ORDER BY run_at ASC LIMIT ${limit_idx} OFFSET ${offset_idx}"
         );
 
         let mut query = sqlx::query_as::<_, ScheduledTask>(&query_str);
@@ -263,14 +320,28 @@ impl SchedulerMcpServer {
             query = query.bind(t);
         }
         query = query.bind(limit);
+        query = query.bind(offset);
 
         match query.fetch_all(self.db.pool()).await {
-            Ok(tasks) => json_result(&tasks),
-            Err(e) => error_result(&format!("Database error: {e}")),
+            Ok(tasks) => json_result(&serde_json::json!({
+                "tasks": tasks,
+                "limit": limit,
+                "offset": offset,
+                "count": tasks.len(),
+            })),
+            Err(e) => {
+                error!(error = %e, "Failed to list scheduled tasks");
+                error_result(&format!("Database error: {e}"))
+            }
         }
     }
 
     async fn handle_cancel_task(&self, task_id: &str) -> CallToolResult {
+        let task_id = task_id.trim();
+        if task_id.is_empty() {
+            return error_result("task_id must not be empty");
+        }
+
         match sqlx::query_as::<_, ScheduledTask>(
             "UPDATE scheduler.tasks SET status = 'cancelled' WHERE id = $1 AND status = 'pending' RETURNING *",
         )
@@ -279,11 +350,14 @@ impl SchedulerMcpServer {
         .await
         {
             Ok(Some(task)) => {
-                info!(id = task_id, "Cancelled task");
+                info!(id = %task_id, "Cancelled task");
                 json_result(&task)
             }
             Ok(None) => error_result(&format!("Task '{task_id}' not found or not in pending status")),
-            Err(e) => error_result(&format!("Failed to cancel task: {e}")),
+            Err(e) => {
+                error!(id = %task_id, error = %e, "Failed to cancel task");
+                error_result(&format!("Failed to cancel task: {e}"))
+            }
         }
     }
 
@@ -296,7 +370,10 @@ impl SchedulerMcpServer {
         .await
         {
             Ok(t) => t,
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to claim due tasks");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         if tasks.is_empty() {
@@ -314,14 +391,17 @@ impl SchedulerMcpServer {
             });
 
             // Insert execution log
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "INSERT INTO scheduler.execution_log (id, task_id, result, success) VALUES ($1, $2, $3, true)",
             )
             .bind(&log_id)
             .bind(&task.id)
             .bind(&exec_result)
             .execute(self.db.pool())
-            .await;
+            .await
+            {
+                error!(task_id = %task.id, error = %e, "Failed to insert execution log");
+            }
 
             // For recurring tasks: reset to pending with next run_at
             if let Some(ref pattern) = task.recurring_pattern {
@@ -331,21 +411,27 @@ impl SchedulerMcpServer {
                     "monthly" => task.run_at + chrono::Duration::days(30),
                     _ => task.run_at + chrono::Duration::days(1),
                 };
-                let _ = sqlx::query(
+                if let Err(e) = sqlx::query(
                     "UPDATE scheduler.tasks SET status = 'pending', run_at = $1, last_run = now() WHERE id = $2",
                 )
                 .bind(next_run)
                 .bind(&task.id)
                 .execute(self.db.pool())
-                .await;
+                .await
+                {
+                    error!(task_id = %task.id, error = %e, "Failed to reschedule recurring task");
+                }
             } else {
                 // Non-recurring: mark completed
-                let _ = sqlx::query(
+                if let Err(e) = sqlx::query(
                     "UPDATE scheduler.tasks SET status = 'completed', last_run = now() WHERE id = $1",
                 )
                 .bind(&task.id)
                 .execute(self.db.pool())
-                .await;
+                .await
+                {
+                    error!(task_id = %task.id, error = %e, "Failed to mark task completed");
+                }
             }
 
             results.push(serde_json::json!({
@@ -361,9 +447,19 @@ impl SchedulerMcpServer {
     }
 
     async fn handle_reschedule(&self, task_id: &str, run_at_str: &str) -> CallToolResult {
+        let task_id = task_id.trim();
+        if task_id.is_empty() {
+            return error_result("task_id must not be empty");
+        }
+
+        let run_at_str = run_at_str.trim();
+        if run_at_str.is_empty() {
+            return error_result("run_at must not be empty");
+        }
+
         let run_at = match Self::parse_timestamp(run_at_str) {
             Some(t) => t,
-            None => return error_result("Invalid run_at timestamp. Use ISO 8601 format"),
+            None => return error_result("Invalid run_at timestamp. Use ISO 8601 format (e.g. 2026-03-06T09:00:00Z)"),
         };
 
         match sqlx::query_as::<_, ScheduledTask>(
@@ -375,37 +471,40 @@ impl SchedulerMcpServer {
         .await
         {
             Ok(Some(task)) => {
-                info!(id = task_id, "Rescheduled task");
+                info!(id = %task_id, new_run_at = %run_at, "Rescheduled task");
                 json_result(&task)
             }
             Ok(None) => error_result(&format!("Task '{task_id}' not found or not in pending status")),
-            Err(e) => error_result(&format!("Failed to reschedule: {e}")),
+            Err(e) => {
+                error!(id = %task_id, error = %e, "Failed to reschedule task");
+                error_result(&format!("Failed to reschedule: {e}"))
+            }
         }
     }
 
     async fn handle_create_recurring(&self, args: &serde_json::Value) -> CallToolResult {
-        let task_type = match get_str(args, "task_type") {
+        let task_type = match get_trimmed_str(args, "task_type") {
             Some(t) => t,
             None => return error_result("Missing required parameter: task_type"),
         };
-        if !["send_email", "follow_up", "reminder"].contains(&task_type.as_str()) {
+        if !VALID_TASK_TYPES.contains(&task_type.as_str()) {
             return error_result("task_type must be one of: send_email, follow_up, reminder");
         }
 
-        let run_at_str = match get_str(args, "run_at") {
+        let run_at_str = match get_trimmed_str(args, "run_at") {
             Some(r) => r,
             None => return error_result("Missing required parameter: run_at"),
         };
         let run_at = match Self::parse_timestamp(&run_at_str) {
             Some(t) => t,
-            None => return error_result("Invalid run_at timestamp. Use ISO 8601 format"),
+            None => return error_result("Invalid run_at timestamp. Use ISO 8601 format (e.g. 2026-03-06T09:00:00Z)"),
         };
 
-        let pattern = match get_str(args, "recurring_pattern") {
+        let pattern = match get_trimmed_str(args, "recurring_pattern") {
             Some(p) => p,
             None => return error_result("Missing required parameter: recurring_pattern"),
         };
-        if !["daily", "weekly", "monthly"].contains(&pattern.as_str()) {
+        if !VALID_PATTERNS.contains(&pattern.as_str()) {
             return error_result("recurring_pattern must be one of: daily, weekly, monthly");
         }
 
@@ -424,10 +523,13 @@ impl SchedulerMcpServer {
         .await
         {
             Ok(task) => {
-                info!(id = id, task_type = task_type, pattern = pattern, "Created recurring task");
+                info!(id = %id, task_type = %task_type, pattern = %pattern, "Created recurring task");
                 json_result(&task)
             }
-            Err(e) => error_result(&format!("Failed to create recurring task: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to create recurring task");
+                error_result(&format!("Failed to create recurring task: {e}"))
+            }
         }
     }
 
@@ -451,7 +553,10 @@ impl SchedulerMcpServer {
         .await
         {
             Ok(s) => s,
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to fetch status counts");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         let by_type: Vec<TypeCount> = match sqlx::query_as(
@@ -461,7 +566,10 @@ impl SchedulerMcpServer {
         .await
         {
             Ok(t) => t,
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to fetch type counts");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         let total: i64 = by_status.iter().map(|s| s.count).sum();
@@ -474,22 +582,29 @@ impl SchedulerMcpServer {
     }
 
     async fn handle_overdue_tasks(&self, args: &serde_json::Value) -> CallToolResult {
-        let limit = get_i64(args, "limit").unwrap_or(50);
+        let limit = clamp_limit(args);
+        let offset = clamp_offset(args);
 
         let tasks: Vec<ScheduledTask> = match sqlx::query_as(
-            "SELECT * FROM scheduler.tasks WHERE status = 'pending' AND run_at < now() ORDER BY run_at ASC LIMIT $1",
+            "SELECT * FROM scheduler.tasks WHERE status = 'pending' AND run_at < now() ORDER BY run_at ASC LIMIT $1 OFFSET $2",
         )
         .bind(limit)
+        .bind(offset)
         .fetch_all(self.db.pool())
         .await
         {
             Ok(t) => t,
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to fetch overdue tasks");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         json_result(&serde_json::json!({
             "overdue_count": tasks.len(),
             "tasks": tasks,
+            "limit": limit,
+            "offset": offset,
         }))
     }
 }
@@ -540,18 +655,18 @@ impl ServerHandler for SchedulerMcpServer {
                 "schedule_task" => self.handle_schedule_task(&args).await,
                 "list_scheduled" => self.handle_list_scheduled(&args).await,
                 "cancel_task" => {
-                    match get_str(&args, "task_id") {
+                    match get_trimmed_str(&args, "task_id") {
                         Some(id) => self.handle_cancel_task(&id).await,
                         None => error_result("Missing required parameter: task_id"),
                     }
                 }
                 "process_due" => self.handle_process_due().await,
                 "reschedule" => {
-                    let task_id = match get_str(&args, "task_id") {
+                    let task_id = match get_trimmed_str(&args, "task_id") {
                         Some(id) => id,
                         None => return Ok(error_result("Missing required parameter: task_id")),
                     };
-                    let run_at = match get_str(&args, "run_at") {
+                    let run_at = match get_trimmed_str(&args, "run_at") {
                         Some(r) => r,
                         None => return Ok(error_result("Missing required parameter: run_at")),
                     };
